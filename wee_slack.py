@@ -6264,12 +6264,27 @@ def command_nodistractions(data, current_buffer, args):
 @utf8_decode
 def command_upload(data, current_buffer, args):
     """
-    /slack upload <filename>
-    Uploads a file to the current buffer.
+    /slack upload <filename> [comment]
+    Uploads a file to the current buffer with an optional comment.
     """
+    import shlex
+
     channel = EVENTROUTER.weechat_controller.buffers[current_buffer]
     weechat_dir = w.info_get("weechat_data_dir", "") or w.info_get("weechat_dir", "")
-    file_path = os.path.join(weechat_dir, os.path.expanduser(args))
+
+    # Parse arguments to support optional comment
+    try:
+        parsed_args = shlex.split(args)
+    except ValueError:
+        # Fall back to simple split if shlex fails
+        parsed_args = args.split(None, 1)
+
+    if not parsed_args:
+        w.prnt("", "ERROR: No filename specified")
+        return w.WEECHAT_RC_ERROR
+
+    file_path = os.path.join(weechat_dir, os.path.expanduser(parsed_args[0]))
+    comment = parsed_args[1] if len(parsed_args) > 1 else None
 
     if channel.type == "team":
         w.prnt("", "ERROR: Can't upload a file to the team buffer")
@@ -6283,16 +6298,19 @@ def command_upload(data, current_buffer, args):
             w.prnt("", "ERROR: Could not find file: {}".format(file_path))
             return w.WEECHAT_RC_ERROR
 
-    post_data = {
-        "channels": channel.identifier,
-    }
-    if isinstance(channel, SlackThreadChannel):
-        post_data["thread_ts"] = channel.thread_ts
+    # Get file info
+    file_size = os.path.getsize(file_path)
+    file_name = os.path.basename(file_path)
 
-    request = SlackRequest(channel.team, "files.upload", post_data, channel=channel)
+    # Step 1: Get upload URL using files.getUploadURLExternal
+    post_data = {
+        "filename": file_name,
+        "length": str(file_size),
+    }
+
+    request = SlackRequest(channel.team, "files.getUploadURLExternal", post_data, channel=channel)
     options = request.options_as_cli_args() + [
         "-s",
-        "-Ffile=@{}".format(file_path),
         request.request_string(),
     ]
 
@@ -6300,9 +6318,19 @@ def command_upload(data, current_buffer, args):
     if proxy_string:
         options.append(proxy_string)
 
+    # Store upload context for the callback chain
+    upload_context = json.dumps({
+        "file_path": file_path,
+        "file_name": file_name,
+        "channel_id": channel.identifier,
+        "thread_ts": channel.thread_ts if isinstance(channel, SlackThreadChannel) else None,
+        "comment": comment,
+        "team_id": channel.team.team_hash,
+    })
+
     options_hashtable = {"arg{}".format(i + 1): arg for i, arg in enumerate(options)}
     w.hook_process_hashtable(
-        "curl", options_hashtable, config.slack_timeout, "upload_callback", ""
+        "curl", options_hashtable, config.slack_timeout, "upload_step1_callback", upload_context
     )
     return w.WEECHAT_RC_OK_EAT
 
@@ -6311,11 +6339,14 @@ command_upload.completion = "%(filename) %-"
 
 
 @utf8_decode
-def upload_callback(data, command, return_code, out, err):
+def upload_step1_callback(data, command, return_code, out, err):
+    """
+    Step 1: Handle response from files.getUploadURLExternal
+    """
     if return_code != 0:
         w.prnt(
             "",
-            "ERROR: Couldn't upload file. Got return code {}. Error: {}".format(
+            "ERROR: Couldn't get upload URL. Got return code {}. Error: {}".format(
                 return_code, err
             ),
         )
@@ -6325,12 +6356,155 @@ def upload_callback(data, command, return_code, out, err):
         response = json.loads(out)
     except JSONDecodeError:
         w.prnt(
-            "", "ERROR: Couldn't process response from file upload. Got: {}".format(out)
+            "", "ERROR: Couldn't process response from upload URL request. Got: {}".format(out)
         )
         return w.WEECHAT_RC_OK_EAT
 
-    if not response["ok"]:
-        w.prnt("", "ERROR: Couldn't upload file. Error: {}".format(response["error"]))
+    if not response.get("ok"):
+        w.prnt("", "ERROR: Couldn't get upload URL. Error: {}".format(response.get("error", "unknown")))
+        return w.WEECHAT_RC_OK_EAT
+
+    # Extract upload URL and file ID
+    upload_url = response.get("upload_url")
+    file_id = response.get("file_id")
+
+    if not upload_url or not file_id:
+        w.prnt("", "ERROR: Missing upload_url or file_id in response")
+        return w.WEECHAT_RC_OK_EAT
+
+    # Parse the context
+    try:
+        context = json.loads(data)
+    except JSONDecodeError:
+        w.prnt("", "ERROR: Couldn't parse upload context")
+        return w.WEECHAT_RC_OK_EAT
+
+    file_path = context["file_path"]
+
+    # Step 2: Upload the file to the upload URL
+    options = [
+        "-s",
+        "-XPOST",
+        "-Ffile=@{}".format(file_path),
+        upload_url,
+    ]
+
+    proxy_string = ProxyWrapper().curl()
+    if proxy_string:
+        options.append(proxy_string)
+
+    # Store context for next step
+    context["file_id"] = file_id
+    upload_context = json.dumps(context)
+
+    options_hashtable = {"arg{}".format(i + 1): arg for i, arg in enumerate(options)}
+    w.hook_process_hashtable(
+        "curl", options_hashtable, config.slack_timeout, "upload_step2_callback", upload_context
+    )
+    return w.WEECHAT_RC_OK_EAT
+
+
+@utf8_decode
+def upload_step2_callback(data, command, return_code, out, err):
+    """
+    Step 2: Handle response from file upload to the upload URL
+    """
+    if return_code != 0:
+        w.prnt(
+            "",
+            "ERROR: Couldn't upload file to URL. Got return code {}. Error: {}".format(
+                return_code, err
+            ),
+        )
+        return w.WEECHAT_RC_OK_EAT
+
+    # The file upload may not return JSON, just check if it succeeded
+    # Parse the context
+    try:
+        context = json.loads(data)
+    except JSONDecodeError:
+        w.prnt("", "ERROR: Couldn't parse upload context")
+        return w.WEECHAT_RC_OK_EAT
+
+    # Step 3: Complete the upload using files.completeUploadExternal
+    file_id = context["file_id"]
+    file_name = context["file_name"]
+    channel_id = context["channel_id"]
+    thread_ts = context.get("thread_ts")
+    comment = context.get("comment")
+    team_id = context["team_id"]
+
+    # Find the team
+    team = None
+    for t in EVENTROUTER.teams.values():
+        if t.team_hash == team_id:
+            team = t
+            break
+
+    if not team:
+        w.prnt("", "ERROR: Couldn't find team for upload completion")
+        return w.WEECHAT_RC_OK_EAT
+
+    # Build the completion request
+    files_data = [{
+        "id": file_id,
+        "title": file_name,
+    }]
+
+    post_data = {
+        "files": json.dumps(files_data),
+        "channel_id": channel_id,
+    }
+
+    if thread_ts:
+        post_data["thread_ts"] = thread_ts
+
+    if comment:
+        post_data["initial_comment"] = comment
+
+    request = SlackRequest(team, "files.completeUploadExternal", post_data)
+    options = request.options_as_cli_args() + [
+        "-s",
+        request.request_string(),
+    ]
+
+    proxy_string = ProxyWrapper().curl()
+    if proxy_string:
+        options.append(proxy_string)
+
+    options_hashtable = {"arg{}".format(i + 1): arg for i, arg in enumerate(options)}
+    w.hook_process_hashtable(
+        "curl", options_hashtable, config.slack_timeout, "upload_step3_callback", ""
+    )
+    return w.WEECHAT_RC_OK_EAT
+
+
+@utf8_decode
+def upload_step3_callback(data, command, return_code, out, err):
+    """
+    Step 3: Handle response from files.completeUploadExternal
+    """
+    if return_code != 0:
+        w.prnt(
+            "",
+            "ERROR: Couldn't complete file upload. Got return code {}. Error: {}".format(
+                return_code, err
+            ),
+        )
+        return w.WEECHAT_RC_OK_EAT
+
+    try:
+        response = json.loads(out)
+    except JSONDecodeError:
+        w.prnt(
+            "", "ERROR: Couldn't process response from upload completion. Got: {}".format(out)
+        )
+        return w.WEECHAT_RC_OK_EAT
+
+    if not response.get("ok"):
+        w.prnt("", "ERROR: Couldn't complete file upload. Error: {}".format(response.get("error", "unknown")))
+    else:
+        w.prnt("", "File uploaded successfully")
     return w.WEECHAT_RC_OK_EAT
 
 

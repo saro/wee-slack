@@ -223,10 +223,10 @@ This command only works when using a session token, see the readme: https://gith
 ### upload
 
 ```
-/slack upload <filename>
+/slack upload <filename> [comment]
 ```
 
-Uploads a file to the current buffer.
+Uploads a file to the current buffer with an optional comment.
 
 ### usergroups
 
