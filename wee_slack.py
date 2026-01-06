@@ -7570,7 +7570,7 @@ def create_team(token, initial_data):
                     users,
                     bots,
                     channels,
-                    muted_channels=initial_data["prefs"]["muted_channels"],
+                    muted_channels=initial_data.get("prefs", {}).get("muted_channels", ""),
                     highlight_words=global_keywords,
                 )
                 eventrouter.register_team(team)
